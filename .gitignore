@@ -1,4 +1,4 @@
 *.pyc
 .terraform
 terraform.tfstate*
-/tf/experiments/data
+/data
