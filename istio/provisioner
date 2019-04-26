@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os.path
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+
+# https://gcsweb.istio.io/gcs/istio-prerelease/daily-build/
+# https://gcsweb.istio.io/gcs/istio-release/releases/
+
+class DefaultProvisioner(object):
+    def __init__(self, kubectl, namespace, build, options, output_dir):
+        self.kubectl = kubectl
+        self.namespace = namespace
+        self.build = build
+        self.options = options
+        self.output_dir = output_dir
+        self.temp_dir = tempfile.mkdtemp()
+
+    def download_artifact(self, artifact, destination):
+        name = os.path.split(artifact)[1]
+        destination_path = os.path.join(destination, name)
+
+        subprocess.check_output([
+            "curl",
+            "--location",
+            "--fail",
+            artifact,
+            "-o", destination_path,
+        ])
+
+        if artifact.lower().endswith(".tgz") or artifact.lower().endswith(".tar.gz"):
+            subprocess.check_output([
+                "tar", "xzf", destination_path, "-C", destination,
+            ])
+
+    def download_build(self, build):
+        RELEASE_URL = "https://storage.googleapis.com/istio-release/?prefix=releases/{}/"
+        SNAPSHOT_URL = "https://storage.googleapis.com/istio-prerelease/?prefix=daily-build/{}/"
+
+        artifacts = []
+
+        for bucket_url in [RELEASE_URL, SNAPSHOT_URL]:
+            #import urllib.request
+            #contents = urllib.request.urlopen(bucket_url.format(build)).read().decode("utf-8")
+            contents = subprocess.check_output([
+                "curl", "--location", "--fail", bucket_url.format(build)
+            ], encoding="utf-8")
+
+            keys = ET.fromstring(contents).findall("./s3:Contents/s3:Key", {
+                "s3": "http://doc.s3.amazonaws.com/2006-03-01",
+            })
+
+            for key in keys:
+                if re.match(r".*/(charts|deb)/istio-.+(\.tgz|\.tar\.gz|\.deb)", key.text.lower()):
+                    artifacts.append(bucket_url.split("?")[0] + key.text)
+
+            if len(artifacts) > 0:
+                break
+
+        if len(artifacts) == 0:
+            raise Exception("couldn't find the specified build")
+
+        local_build_path = self.temp_dir
+        for artifact in artifacts:
+            self.download_artifact(artifact, local_build_path)
+
+        print("build {} was downloaded to {}".format(build, local_build_path))
+        return local_build_path
+
+    def get_num_crds(self):
+        result = subprocess.check_output(kubectl + [
+            "get", "customresourcedefinition",
+        ], encoding="utf-8")
+
+        is_istio = lambda crd: "istio.io" in crd or "certmanager.k8s.io" in crd
+        crds = [crd for crd in result.split("\n") if is_istio]
+
+        return len(crds)
+
+    def get_gateway_ip(self):
+        gateway_ip = None
+        while not gateway_ip:
+            gateway_ip = subprocess.check_output(kubectl + [
+                "-n", "istio-system",
+                "get", "service", "istio-ingressgateway",
+                "-o", "jsonpath={.status.loadBalancer.ingress[0].ip}",
+            ], encoding="utf-8").strip()
+
+            if gateway_ip:
+                return gateway_ip
+            else:
+                print("Istio IngressGateway IP address is still being provisioned. Waiting...")
+                time.sleep(5)
+
+    def install_build(self, local_build_path, namespace, flags):
+        print("ensuring Istio CRDs are installed...")
+        EXPECTED_MIN_NUM_CRDS = 53
+
+        if self.get_num_crds() < EXPECTED_MIN_NUM_CRDS:
+            helm_release = "istio-init"
+
+            rendered_tpl = subprocess.check_output([
+                "helm", "template",
+                os.path.join(local_build_path, "istio-init"),
+                "--name", helm_release,
+                "--namespace", namespace,
+            ], encoding="utf-8")
+
+            subprocess.check_output(kubectl + [
+                "apply",
+                "-n", namespace,
+                "-f", "-"
+            ], input=rendered_tpl, encoding="utf-8")
+
+            while True:
+                num_crds = self.get_num_crds()
+                if num_crds < EXPECTED_MIN_NUM_CRDS:
+                    print("only {} CRDs are installed. waiting...".format(num_crds))
+                    time.sleep(5)
+                else:
+                    print("{} Istio CRDs are installed".format(num_crds))
+                    break
+        print("at least {} Istio CRDs are installed".format(EXPECTED_MIN_NUM_CRDS))
+
+        print("installing Istio...")
+        helm_release = "istio"
+
+        args = [
+            "helm", "template",
+            os.path.join(local_build_path, "istio"),
+            "--name", helm_release,
+            "--namespace", namespace,
+        ]
+
+        for flag, flag_val in flags.items():
+            args += ["--set", "{}={}".format(flag, flag_val)]
+
+        rendered_tpl = subprocess.check_output(args, encoding="utf-8")
+        #rendered_tpl = self.patch_install_manifest(rendered_tpl)
+
+        subprocess.check_output(kubectl + [
+            "apply",
+            "-n", namespace,
+            "--prune", "-l", "release={}".format(helm_release),
+            "-f", "-"
+        ], input=rendered_tpl, encoding="utf-8")
+        print("Istio is installed")
+
+    def provision(self):
+        local_build_path = self.download_build(self.build)
+        self.install_build(local_build_path, self.namespace, self.options)
+
+        shutil.copyfile(
+            os.path.join(self.temp_dir, "istio-sidecar.deb"),
+            os.path.join(self.output_dir, "istio-sidecar.deb"))
+
+        gateway_ip = self.get_gateway_ip()
+        with open(os.path.join(self.output_dir, "hosts"), "w") as fout:
+            fout.write("\n{} istio-citadel istio-pilot istio-pilot.istio-system\n".format(gateway_ip))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("-n", "--namespace", type=str, required=True,
+        help="namespace that needs to be provisioned with an Istio component")
+    parser.add_argument("-cfg", "--kubeconfig", type=str,
+        help="path to a custom kubeconfig file to use with kubectl")
+    parser.add_argument("-ctx", "--context", type=str,
+        help="name of a specific kubeconfig context to use with kubectl")
+    parser.add_argument("-o", "--output", type=str,
+        help="output directory")
+
+    args = parser.parse_args()
+
+    kubectl = ["kubectl"]
+    if args.kubeconfig is not None:
+        kubectl += ["--kubeconfig={}".format(args.kubeconfig)]
+    if args.context is not None:
+        kubectl += ["--context={}".format(args.context)]
+
+    namespace_json = subprocess.check_output(kubectl + [
+        "get", "ns", args.namespace, "-o", "json",
+    ], encoding="utf-8")
+    namespace = json.loads(namespace_json)
+
+    CONFIG_PREFIX = "istio.provisioner."
+    OPTION_PREFIX = "options."
+
+    build = None
+    options = {}
+    output_dir = args.output
+
+    for annotation, value in namespace["metadata"]["annotations"].items():
+        if annotation.startswith(CONFIG_PREFIX):
+            config_key = annotation[len(CONFIG_PREFIX):]
+
+            if config_key == "build":
+                build = value
+            elif config_key.startswith(OPTION_PREFIX):
+                option_key = config_key[len(OPTION_PREFIX):]
+                options[option_key] = value
+
+    DefaultProvisioner(kubectl, args.namespace, build, options, output_dir).provision()
