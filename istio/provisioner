@@ -10,8 +10,6 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 
-# https://gcsweb.istio.io/gcs/istio-prerelease/daily-build/
-# https://gcsweb.istio.io/gcs/istio-release/releases/
 
 class DefaultProvisioner(object):
     def __init__(self, kubectl, namespace, build, options, output_dir):
@@ -23,6 +21,10 @@ class DefaultProvisioner(object):
         self.temp_dir = tempfile.mkdtemp()
 
     def download_artifact(self, artifact, destination):
+        """
+        - https://gcsweb.istio.io/gcs/istio-prerelease/daily-build/
+        - https://gcsweb.istio.io/gcs/istio-release/releases/
+        """
         name = os.path.split(artifact)[1]
         destination_path = os.path.join(destination, name)
 
@@ -98,6 +100,21 @@ class DefaultProvisioner(object):
                 print("Istio IngressGateway IP address is still being provisioned. Waiting...")
                 time.sleep(5)
 
+    def get_kubedns_ip(self):
+        kubedns_ip = None
+        while not kubedns_ip:
+            kubedns_ip = subprocess.check_output(kubectl + [
+                "-n", "kube-system",
+                "get", "service", "kube-dns",
+                "-o", "jsonpath={.spec.clusterIP}",
+            ], encoding="utf-8").strip()
+
+            if kubedns_ip:
+                return kubedns_ip
+            else:
+                print("Kube-DNS IP address is still being provisioned. Waiting...")
+                time.sleep(5)
+
     def install_build(self, local_build_path, namespace, flags):
         print("ensuring Istio CRDs are installed...")
         EXPECTED_MIN_NUM_CRDS = 53
@@ -163,6 +180,10 @@ class DefaultProvisioner(object):
         gateway_ip = self.get_gateway_ip()
         with open(os.path.join(self.output_dir, "hosts"), "w") as fout:
             fout.write("\n{} istio-citadel istio-pilot istio-pilot.istio-system\n".format(gateway_ip))
+
+        kubedns_ip = self.get_kubedns_ip()
+        with open(os.path.join(self.output_dir, "resolv.conf"), "w") as fout:
+            fout.write("options use-vc\nnameserver {}\n".format(kubedns_ip))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

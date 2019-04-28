@@ -1,27 +1,36 @@
+# Input arguments
+#
+# Can be passed via command line arguments (example: `-var="key=value"`), environment variables
+# (example: `TF_VAR_key=value`) or `.tfvars`-files (example: `-var-file="hcl-format-keys-and-vals.tfvars"`).
+
 variable "gcp_project" {
-  type    = "string"
+  type = "string"
   default = "istio-test-230101"
+  description = "PROJECT_ID of GCP Project (e.g. `istio-test-230101`)"
 }
-variable "gcp_api_key_path" {
-  type    = "string"
+variable "gcp_credentials" {
+  type = "string"
   default = "~/account.json"
+  description = "Path to a GCP service account JSON key file (can be generated/obtained from 'IAM & Admin' / 'Service Accounts')"
 }
 variable "prefix" {
-  type    = "string"
+  type = "string"
   default = "test"
+  description = "Arbitrary prefix that can be used to disambiguate resources related to multiple instances of this configuration"
 }
 
+# Provisioning a GKE cluster for Istio and example services
 
 provider "google" {
-  credentials = "${file(var.gcp_api_key_path)}"
+  credentials = "${file(var.gcp_credentials)}"
   project     = "${var.gcp_project}"
   region      = "us-central1"
   zone        = "us-central1-a"
 }
 
 resource "google_container_cluster" "primary" {
-  name               = "${var.prefix}-tf-exp-primary"
-  initial_node_count = 4
+  name               = "${var.prefix}-tf-mx-primary"
+  initial_node_count = 3
 
   # disable basic auth
   master_auth {
@@ -49,7 +58,7 @@ resource "google_container_cluster" "primary" {
 data "google_client_config" "default" {}
 
 
-############################
+# Kubernetes credentials for the GKE cluster and RBAC initialization
 
 provider "kubernetes" {
   load_config_file = false
@@ -100,28 +109,19 @@ users:
 __EOF__
 }
 
-
-##################
+# Installing Istio
 
 resource "kubernetes_namespace" "istio_system" {
   metadata {
     name = "istio-system"
     annotations {
-      istio.provisioner.build = "1.1.2"
+      istio.provisioner.build = "1.1.4"
       #istio.provisioner.build = "release-1.1-20190402-09-16"
       #istio.provisioner.build = "release-1.1-latest-daily"
 
       #istio.provisioner.options.global.mtls.enabled = "true"
       istio.provisioner.options.global.meshExpansion.enabled = "true"
       #istio.provisioner.options.global.controlPlaneSecurityEnabled = "false"
-      #istio.provisioner.options.global.sds.enabled = "true"
-      #istio.provisioner.options.global.sds.udsPath = "unix:/var/run/sds/uds_path"
-      #istio.provisioner.options.global.sds.useNormalJwt = "true"
-      #istio.provisioner.options.nodeagent.enabled = "true"
-      #istio.provisioner.options.nodeagent.image = "node-agent-k8s"
-      #istio.provisioner.options.nodeagent.env.CA_PROVIDER = "Citadel"
-      #istio.provisioner.options.nodeagent.env.CA_ADDR = "istio-citadel:8060"
-      #istio.provisioner.options.nodeagent.env.VALID_TOKEN = "true"
     }
   }
 }
@@ -137,6 +137,108 @@ resource "null_resource" "istio_system" {
   }
 }
 
+# Enabling access to `kube-dns` service (that is not Istio-aware) from within the mesh.
+
+resource "local_file" "kubedns_drule" {
+  depends_on = [
+    "kubernetes_namespace.istio_system",
+    "null_resource.istio_system",
+  ]
+
+  filename = "${path.module}/data/kubedns_drule.yaml"
+
+  content = <<__EOF__
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: kube-dns
+  namespace: istio-system
+spec:
+  host: kube-dns.kube-system.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: DISABLE
+__EOF__
+}
+
+resource "null_resource" "kubedns_drule" {
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig=${local_file.kubeconfig.filename} --context=primary apply -f ${local_file.kubedns_drule.filename}"
+  }
+}
+
+# Setting up test service
+
+resource "kubernetes_namespace" "internal" {
+  depends_on = [
+    "kubernetes_namespace.istio_system",
+    "null_resource.istio_system",
+  ]
+
+  metadata {
+    name = "internal"
+    labels {
+      istio-injection = "enabled"
+    }
+  }
+}
+
+resource "kubernetes_service" "test_service" {
+  metadata {
+    name = "test-service"
+    namespace = "${kubernetes_namespace.internal.metadata.0.name}"
+  }
+  spec {
+    selector {
+      app = "test-service"
+    }
+    port {
+      port = 8080
+      name = "http-echo"
+    }
+  }
+}
+
+resource "kubernetes_deployment" "test_service" {
+  depends_on = [
+    "kubernetes_service.test_service"
+  ]
+
+  metadata {
+    name = "test-service"
+    namespace = "${kubernetes_namespace.internal.metadata.0.name}"
+  }
+
+  spec {
+    selector {
+      match_labels {
+        app = "test-service"
+      }
+    }
+    template {
+      metadata {
+        labels {
+          app = "test-service"
+        }
+      }
+      spec {
+        container {
+          image = "fortio/fortio"
+          name = "test-service"
+          port {
+            container_port = "8080"
+          }
+          args = [
+            "server",
+          ]
+        }
+      }
+    }
+  }
+}
+
+# Extracting/creating Istio-related artifacts that need to be provisioned to the mesh expansion VMs
+
 resource "local_file" "cluster_env" {
   filename = "${path.module}/data/cluster.env"
   content = <<__EOF__
@@ -150,6 +252,9 @@ resource "kubernetes_namespace" "external" {
 
   metadata {
     name = "external"
+    labels {
+      istio-injection = "enabled"
+    }
   }
 
   provisioner "local-exec" {
@@ -166,9 +271,7 @@ resource "kubernetes_namespace" "external" {
   }
 }
 
-
-###########
-
+# Creating a VM, setting up SSH access (used to transfer required artifacts and perform initialization)
 
 resource "google_compute_firewall" "allow_ssh" {
   name = "${var.prefix}-allow-ssh"
@@ -208,8 +311,19 @@ resource "google_compute_instance" "meshx_vm_instance_1" {
     ssh-keys = "client:${tls_private_key.meshx_vm_key.public_key_openssh}"
   }
 
+  # Backing up original hosts-file (allows for idempotency later on)
   provisioner "remote-exec" {
     inline = [ "sudo cp /etc/hosts hosts.orig" ]
+    connection = {
+      type = "ssh"
+      user = "client"
+      private_key = "${tls_private_key.meshx_vm_key.private_key_pem}"
+      agent = "false"
+    }
+  }
+  # Backing up original resolv.conf-file (allows for idempotency later on)
+  provisioner "remote-exec" {
+    inline = [ "sudo cp /etc/resolv.conf resolv.conf.orig" ]
     connection = {
       type = "ssh"
       user = "client"
@@ -222,10 +336,14 @@ resource "google_compute_instance" "meshx_vm_instance_1" {
   tags = ["meshx-vm-instance"]
 }
 
+# Configuring VM to enable communication between the services via Istio mesh
+
 resource "null_resource" "meshx_vm_instance_1" {
   depends_on = [
     "kubernetes_namespace.external",
     "null_resource.istio_system",
+    "null_resource.kubedns_drule",
+    "google_compute_firewall.allow_ssh",
   ]
 
   triggers {
@@ -252,6 +370,10 @@ resource "null_resource" "meshx_vm_instance_1" {
     destination = "/home/client/hosts"
   }
   provisioner "file" {
+    source      = "${path.module}/data/resolv.conf"
+    destination = "/home/client/resolv.conf"
+  }
+  provisioner "file" {
     source      = "${path.module}/data/istio-sidecar.deb"
     destination = "/home/client/istio-sidecar.deb"
   }
@@ -270,6 +392,7 @@ resource "null_resource" "meshx_vm_instance_1" {
 
   provisioner "remote-exec" {
     inline = [
+      "sudo apt install -y dnsutils",
       "sudo dpkg -i istio-sidecar.deb",
 
       "cat hosts.orig | sudo tee /etc/hosts > /dev/null",
@@ -284,6 +407,82 @@ resource "null_resource" "meshx_vm_instance_1" {
 
       "sudo systemctl start istio-auth-node-agent",
       "sudo systemctl start istio",
+
+      "sudo cp resolv.conf /etc/resolv.conf",
+
+      "until dig +tcp +short test-service.internal.svc.cluster.local; do sleep 3; done;",
+      "curl --fail http://test-service.internal.svc.cluster.local:8080/debug",
+      "echo \"[OK] verified connectivity: MESH EXPANSION VM -> ISTIO MESH\"",
+
+      "nohup python -m SimpleHTTPServer 8080 </dev/null >http.log 2>&1 &",
+      "sleep 3",
+      "exit",
     ]
+  }
+}
+
+# Adding a service running on a mesh expansion VM to the Istio mesh
+
+resource "kubernetes_service" "vmhttp" {
+  metadata {
+    name = "vmhttp"
+    namespace = "${kubernetes_namespace.external.metadata.0.name}"
+  }
+  spec {
+    port {
+      port = 8080
+      protocol = "TCP"
+    }
+  }
+}
+
+resource "local_file" "vmhttp_serviceentry" {
+  filename = "${path.module}/data/vmhttp_serviceentry.yaml"
+
+  content = <<__EOF__
+apiVersion: networking.istio.io/v1alpha3
+kind: ServiceEntry
+metadata:
+  name: vmhttp
+  namespace: ${kubernetes_namespace.external.metadata.0.name}
+spec:
+  hosts:
+  - vmhttp.${kubernetes_namespace.external.metadata.0.name}.svc.cluster.local
+  ports:
+  - number: 8080
+    name: http
+    protocol: HTTP
+  resolution: STATIC
+  endpoints:
+  - address: ${google_compute_instance.meshx_vm_instance_1.network_interface.0.network_ip}
+    ports:
+      http: 8080
+    labels:
+      app: vmhttp
+      version: "v1"
+__EOF__
+}
+
+resource "null_resource" "vmhttp_serviceentry" {
+  depends_on = [
+    "kubernetes_service.vmhttp",
+    "null_resource.meshx_vm_instance_1",
+    "kubernetes_deployment.test_service"
+  ]
+
+  triggers {
+    vmhttp_serviceentry_file_change = "local_file.vmhttp_serviceentry.content"
+  }
+
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig=${local_file.kubeconfig.filename} --context=primary apply -f ${local_file.vmhttp_serviceentry.filename}"
+  }
+
+  provisioner "local-exec" {
+    command = <<__EOF__
+POD=$$(kubectl --kubeconfig=${local_file.kubeconfig.filename} --context=primary -n internal get pods -l app=test-service -o jsonpath={.items[0].metadata.name})
+kubectl --kubeconfig=${local_file.kubeconfig.filename} --context=primary -n internal exec -it $$POD -- fortio curl http://vmhttp.external.svc.cluster.local:8080/
+echo "[OK] verified connectivity: ISTIO MESH -> MESH EXPANSION VM"
+__EOF__
   }
 }
